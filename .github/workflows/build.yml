@@ -36,7 +36,7 @@ jobs:
           convert assets/icon.png -resize 824x824 -background white -gravity center -extent 1024x1024 assets/logo.png
           convert assets/logo.png -matte assets/mask.png -compose DstIn -composite assets/logo-rounded.png
           convert assets/logo-rounded.png -resize 824x824 -background transparent -gravity center -extent 1024x1024 assets/logo-rounded-mac.png
-          icnsify -i assets/logo-rounded.png -o assets/icon.icns
+          $(go env GOPATH | awk '{print $1 "/bin"}')/icnsify  -i assets/logo-rounded.png -o assets/icon.icns
 
       - name: Install dependencies
         run: npm ci
