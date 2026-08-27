@@ -838,13 +838,13 @@ function joinPath(a: string, b: string): string {
   return (a.replace(/\/+$/, '') + '/' + b).replace(/\/+/g, '/')
 }
 
-const ESCAPE_MAP = {
+const ESCAPE_MAP: Record<string, string> = {
   '&': '&amp;',
   '<': '&lt;',
   '>': '&gt;',
   '"': '&quot;',
   "'": '&#39;',
-} satisfies Record<string, string>
+}
 
 function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ESCAPE_MAP[c] ?? c)

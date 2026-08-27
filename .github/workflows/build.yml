@@ -22,11 +22,16 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+
       - name: Icon converter
         run: go install github.com/jackmordaunt/icns/cmd/icnsify@latest
 
       - name: Create icon
-        run : |
+        run: |
           convert -size 1024x1024 xc:none -draw "roundrectangle 0,0,1023,1023,256,256" assets/mask.png
           convert assets/icon.png -resize 824x824 -background white -gravity center -extent 1024x1024 assets/logo.png
           convert assets/logo.png -matte assets/mask.png -compose DstIn -composite assets/logo-rounded.png
