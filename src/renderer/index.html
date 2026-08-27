@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:"
+    />
+    <title>K8s Volume Explorer</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header id="toolbar">
+      <div class="brand">⎈ Volume Explorer</div>
+
+      <label
+        >Context
+        <select id="sel-context">
+          <option value="">loading…</option>
+        </select>
+      </label>
+
+      <label
+        >Namespace
+        <select id="sel-namespace" disabled>
+          <option value="">—</option>
+        </select>
+      </label>
+
+      <label
+        >Pod
+        <select id="sel-pod" disabled>
+          <option value="">—</option>
+        </select>
+      </label>
+
+      <label
+        >Volume
+        <select id="sel-mount" disabled>
+          <option value="">—</option>
+        </select>
+      </label>
+
+      <div class="spacer"></div>
+
+      <button id="btn-kubeconfig" title="Choose which kubeconfig file to use">⛁ Config…</button>
+      <button id="btn-newfolder" title="New folder" disabled>＋ Folder</button>
+      <button id="btn-refresh" title="Reload directory (⌘R)" disabled>⟳</button>
+    </header>
+
+    <nav id="breadcrumb" aria-label="Path"></nav>
+
+    <main id="file-area">
+      <table id="file-table">
+        <thead>
+          <tr>
+            <th class="col-icon"></th>
+            <th>Name</th>
+            <th class="col-size">Size</th>
+            <th class="col-date">Modified</th>
+            <th class="col-perms">Mode</th>
+          </tr>
+        </thead>
+        <tbody id="file-rows"></tbody>
+      </table>
+      <div id="empty-hint" hidden>No files in this directory.</div>
+      <div id="welcome">
+        <h2>Kubernetes Volume Explorer</h2>
+        <p>Pick a context, namespace, pod and volume above to browse its contents.</p>
+        <p id="welcome-kubeconfig"></p>
+        <ul>
+          <li><b>Drag out</b> files to Finder / desktop to download them.</li>
+          <li><b>Drop</b> files or folders onto a folder to upload them there.</li>
+          <li>Double-click folders to navigate, double-click files to open them locally.</li>
+        </ul>
+      </div>
+    </main>
+
+    <footer id="statusbar">
+      <span id="status-text">Ready</span>
+      <span id="status-spinner" class="spinner" hidden></span>
+      <span class="spacer"></span>
+      <span id="selection-info"></span>
+    </footer>
+
+    <script src="app.js"></script>
+  </body>
+</html>
