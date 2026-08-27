@@ -25,7 +25,6 @@
   "bugs": {
     "url": "https://github.com/cmahnke/k8s-pv-gui/issues"
   },
-  "type": "module",
   "build": {
     "appId": "org.projektemacher.plastikwarenfabrik.k8s-volume-explorer",
     "productName": "K8s Volume Explorer",
