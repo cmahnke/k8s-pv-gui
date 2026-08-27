@@ -3,7 +3,13 @@
   "productName": "K8s Volume Explorer",
   "version": "0.1.0",
   "description": "Browse and manage Kubernetes volume contents like a file manager",
-  "author": "Christian Mahnke",
+  "contributors": [
+    {
+      "name": "Christian Mahnke",
+      "email": "plastikwarenfabrik@projektemacher.org",
+      "url": "http://christianmahnke.de/"
+    }
+  ],
   "license": "CC0",
   "main": "dist/main.js",
   "repository": {
@@ -19,6 +25,7 @@
   "bugs": {
     "url": "https://github.com/cmahnke/k8s-pv-gui/issues"
   },
+  "type": "module",
   "build": {
     "appId": "org.projektemacher.plastikwarenfabrik.k8s-volume-explorer",
     "productName": "K8s Volume Explorer",
@@ -52,8 +59,7 @@
     },
     "linux": {
       "target": [
-        "AppImage",
-        "deb"
+        "AppImage"
       ],
       "category": "Utility"
     }
