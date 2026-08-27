@@ -1,0 +1,7 @@
+{
+  "extends": ["stylelint-config-standard"],
+  "rules": {
+    "no-descending-specificity": null
+  },
+  "ignoreFiles": ["dist/**", "release/**", "build/**", "node_modules/**", "tools/**"]
+}

@@ -1,0 +1,27 @@
+# dependencies / builds
+node_modules/
+dist/
+release/
+
+# logs & temp
+*.log
+tmp/
+
+# environment
+.env
+.env.*
+
+# editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# images
+assets/logo*
+assets/*.icns
+assets/mask*

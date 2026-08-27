@@ -1,0 +1,95 @@
+{
+  "name": "k8s-pv-gui",
+  "productName": "K8s Volume Explorer",
+  "version": "0.1.0",
+  "description": "Browse and manage Kubernetes volume contents like a file manager",
+  "author": "Christian Mahnke",
+  "license": "CC0",
+  "main": "dist/main.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cmahnke/k8s-pv-gui.git"
+  },
+  "keywords": [
+    "HDR",
+    "canvas",
+    "3D",
+    "Three.js"
+  ],
+  "bugs": {
+    "url": "https://github.com/cmahnke/k8s-pv-gui/issues"
+  },
+  "build": {
+    "appId": "org.projektemacher.plastikwarenfabrik.k8s-volume-explorer",
+    "productName": "K8s Volume Explorer",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "icon": "assets/icon.png",
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "category": "public.app-category.developer-tools",
+      "identity": null,
+      "icon": "assets/icon.icns"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "category": "Utility"
+    }
+  },
+  "scripts": {
+    "tsc": "tsc",
+    "clean": "rimraf ./dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts,.tsx",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "stylelint": "stylelint 'src/**/*.css'",
+    "check": "npm run lint && npm run typecheck && npm run format:check && npm run stylelint",
+    "build": "npm run lint && node build.mjs",
+    "start": "npm run build && electron .",
+    "dist": "npm run build && electron-builder",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:win": "npm run build && electron-builder --win",
+    "dist:linux": "npm run build && electron-builder --linux"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/archiver": "^8.0.0",
+    "@types/node": "^26.4.0",
+    "@typescript-eslint/eslint-plugin": "^8.68.0",
+    "@typescript-eslint/parser": "^8.68.0",
+    "archiver": "^8.0.0",
+    "electron": "^43.4.1",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.9.1",
+    "prettier": "^3.9.6",
+    "rimraf": "^6.1.3",
+    "stylelint": "^17.14.1",
+    "stylelint-config-standard": "^40.0.0",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.68.0"
+  }
+}

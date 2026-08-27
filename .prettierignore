@@ -1,0 +1,8 @@
+dist/
+release/
+build/
+node_modules/
+package-lock.json
+
+# vendored upstream plugin — keep its formatting as-is
+tools/oxlint/anti-slop/
