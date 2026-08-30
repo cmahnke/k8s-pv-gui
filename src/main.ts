@@ -112,6 +112,16 @@ interface RunOptions {
   maxBuffer?: number
 }
 
+function isConnectionError(msg: string): boolean {
+  return /connection.*refused|was refused|unable to connect|did you specify the right host|6443.*refused|ECONNREFUSED|connection timed out|network is unreachable|no such host|certificate.*expired|tls.*handshake|dial tcp/i.test(
+    msg,
+  )
+}
+
+function isUnexpectedEofError(msg: string): boolean {
+  return /unexpected EOF/i.test(msg)
+}
+
 function runKubectl(
   args: string[],
   { timeout = 30000, maxBuffer = 32 * 1024 * 1024 }: RunOptions = {},
@@ -123,8 +133,18 @@ function runKubectl(
       { timeout, maxBuffer, encoding: 'utf8' },
       (err, stdout, stderr) => {
         if (err) {
-          const msg = (stderr || err.message || 'kubectl failed').trim()
-          reject(new Error(msg))
+          const raw = (stderr || err.message || 'kubectl failed').trim()
+          // Tag connection errors so the renderer can render a beautiful banner.
+          // Keep the original message (with cause) for diagnostics.
+          const msg = isConnectionError(raw) ? `Cluster unreachable: ${raw}` : raw
+          const wrapped = new Error(msg, { cause: err })
+          // Attach a machine-readable code for the renderer without relying on string parsing.
+          ;(wrapped as unknown as Record<string, unknown>).code = isConnectionError(raw)
+            ? 'CONNECTION_REFUSED'
+            : isUnexpectedEofError(raw)
+              ? 'UNEXPECTED_EOF'
+              : 'KUBECTL_ERROR'
+          reject(wrapped)
         } else {
           resolve(stdout)
         }
@@ -153,9 +173,23 @@ function send(payload: OpProgress): void {
   }
 }
 
-function progress(op: OpKind, detail: string, state: OpState = 'running'): void {
+function progress(op: OpKind, detail: string, state: OpState = 'running', percent?: number): void {
   const payload: OpProgress = { op, detail, state }
+  if (typeof percent === 'number') {
+    // Clamp to 0-100 for the renderer and for setProgressBar
+    payload.percent = Math.max(0, Math.min(100, Math.round(percent)))
+  }
   send(payload)
+  // Mirror to OS dock/taskbar progress (Electron). Indeterminate (2) when
+  // running without percent, none (-1) when done/error, determinate 0-1 otherwise.
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (state === 'running') {
+      if (typeof payload.percent === 'number') mainWindow.setProgressBar(payload.percent / 100)
+      else mainWindow.setProgressBar(2)
+    } else {
+      mainWindow.setProgressBar(-1)
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,16 +454,96 @@ async function downloadItem(
   progress('download', `Downloading ${name}`)
   try {
     await runKubectl(cpArgs, { timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 })
+    // Verify the result actually exists and looks sane – kubectl cp can exit 0
+    // but leave a truncated file when the tar stream hits EOF early.
+    const st = await fsp.stat(localDest).catch(() => null)
+    if (!st) throw new Error(`Downloaded path not found: ${localDest}`)
     return localDest
   } catch (e) {
-    // Fallback for containers without tar: stream single files with cat.
+    const msg = e instanceof Error ? e.message : String(e)
+    // For directories, kubectl cp's "unexpected EOF" is typically a tar streaming
+    // bug (large dir, symlink loop, sparse file). Retry via `kubectl exec tar`
+    // piped to a local tar extraction – avoids the client-side tar used by cp.
     const statRes = await runKubectl([...podArgs(sel), '--', 'ls', '-ld', remotePath]).catch(
       () => '',
     )
-    if (statRes.startsWith('d')) throw e
+    const isDir = statRes.startsWith('d')
+    if (isDir && isUnexpectedEofError(msg)) {
+      // Remove any partial result left by the failed cp.
+      await fsp.rm(localDest, { recursive: true, force: true }).catch(() => {})
+      progress('download', `Retrying ${name} via tar…`)
+      await downloadDirViaTar(sel, remotePath, destDir)
+      return localDest
+    }
+    if (isDir) throw e
+    // Fallback for containers without tar: stream single files with cat.
     await catToFile(sel, remotePath, localDest)
     return localDest
   }
+}
+
+function downloadDirViaTar(sel: KubectlTarget, remotePath: string, destDir: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const parent = path.posix.dirname(remotePath)
+    const base = basename(remotePath)
+    // Prefer `tar` directly; wrap in sh -c to handle quirky image PATHs and
+    // to ensure proper quoting of parent/base. Use cf - to stream to stdout.
+    const remoteCmd = `tar cf - -C ${shq(parent)} ${shq(base)}`
+    const kubectlChild = spawn(
+      'kubectl',
+      [...kubeconfigArgs(), ...podArgs(sel), '--', 'sh', '-c', remoteCmd],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    )
+    const tarChild = spawn('tar', ['xf', '-', '-C', destDir], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+    })
+    kubectlChild.stdout!.pipe(tarChild.stdin!)
+    let stderr = ''
+    kubectlChild.stderr!.on('data', (d) => {
+      stderr += d.toString()
+    })
+    tarChild.stderr!.on('data', (d) => {
+      stderr += d.toString()
+    })
+    kubectlChild.on('error', (err) => {
+      tarChild.kill()
+      reject(err)
+    })
+    tarChild.on('error', (err) => {
+      kubectlChild.kill()
+      // If local tar is missing (e.g. Windows), surface a clear message
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        reject(
+          new Error(
+            `Local "tar" not found – cannot retry download for "${base}". Try downloading files individually.`,
+          ),
+        )
+      } else reject(err)
+    })
+    let kubectlCode: number | null = null
+    let tarCode: number | null = null
+    const maybeDone = (): void => {
+      if (kubectlCode !== null && tarCode !== null) {
+        if (kubectlCode === 0 && tarCode === 0) resolve()
+        else {
+          const hint = /tar:.*not found|executable file not found/i.test(stderr)
+            ? ' (container has no tar)'
+            : ''
+          reject(new Error((stderr || `tar transfer failed (${kubectlCode}/${tarCode})`) + hint))
+        }
+      }
+    }
+    kubectlChild.on('close', (code) => {
+      kubectlCode = code ?? 1
+      // If kubectl already failed, close tar's stdin so it doesn't hang.
+      if (kubectlCode !== 0) tarChild.stdin!.end()
+      maybeDone()
+    })
+    tarChild.on('close', (code) => {
+      tarCode = code ?? 1
+      maybeDone()
+    })
+  })
 }
 
 function catToFile(sel: KubectlTarget, remotePath: string, localDest: string): Promise<void> {
@@ -744,18 +858,65 @@ async function uploadPaths(sel: KubectlTarget, dir: string, localPaths: string[]
 }
 
 /** Zip a local directory; the archive contains the folder itself as root. */
-function zipDirectory(srcDir: string, outZip: string): Promise<void> {
+function zipDirectory(
+  srcDir: string,
+  outZip: string,
+  onProgress?: (percent: number) => void,
+): Promise<void> {
   return new Promise((resolve, reject) => {
+    let settled = false
+    const done = (err?: unknown): void => {
+      if (settled) return
+      settled = true
+      if (err) reject(err instanceof Error ? err : new Error(String(err)))
+      else resolve()
+    }
     const output = fs.createWriteStream(outZip)
     const archive = new ZipArchive({
       zlib: { level: 9 }, // Sets the compression level.
     })
-    output.on('close', () => resolve())
-    output.on('error', reject)
-    archive.on('error', reject)
+    output.on('close', () => done())
+    output.on('error', (e) => done(e))
+    archive.on('error', (e) => done(e))
+    // archiver emits 'warning' for stat failures (e.g. broken symlinks,
+    // permission issues). Treat ENOENT as non-fatal so one bad entry doesn't
+    // abort the whole zip – mirrors Finder's behavior.
+    archive.on('warning', (w: Error & { code?: string }) => {
+      if (w.code === 'ENOENT') {
+        console.warn('zip warning (skipped):', w.message)
+      } else done(w)
+    })
+    if (onProgress) {
+      // archiver ProgressData: { entries: {total, processed}, fs: {totalBytes, processedBytes} }
+      // totalBytes is 0 until the file walk is done, so fall back to entry ratio.
+      archive.on(
+        'progress',
+        (p: {
+          entries: { total: number; processed: number }
+          fs: { totalBytes: number; processedBytes: number }
+        }) => {
+          let pct: number
+          if (p.fs.totalBytes > 0) pct = (p.fs.processedBytes / p.fs.totalBytes) * 100
+          else if (p.entries.total > 0) pct = (p.entries.processed / p.entries.total) * 100
+          else pct = 0
+          onProgress(Math.max(0, Math.min(100, Math.round(pct))))
+        },
+      )
+    }
     archive.pipe(output)
-    archive.directory(srcDir, basename(srcDir))
-    archive.finalize().catch(reject)
+    // Verify source exists and is a directory before handing to archiver.
+    fsp
+      .stat(srcDir)
+      .then((st) => {
+        if (!st.isDirectory()) {
+          // Single file: use file() instead of directory() to avoid ENOENT.
+          archive.file(srcDir, { name: basename(srcDir) })
+        } else {
+          archive.directory(srcDir, basename(srcDir))
+        }
+        archive.finalize().catch((e) => done(e))
+      })
+      .catch((e) => done(e))
   })
 }
 
@@ -777,9 +938,31 @@ ipcMain.handle('fs:downloadZip', async (_e: IpcMainInvokeEvent, req: DownloadZip
   await fsp.mkdir(stageDir, { recursive: true })
   try {
     progress('download', `Downloading ${req.name}…`)
-    const localDir = await downloadItem(req.sel, req.path, stageDir)
-    progress('download', `Zipping ${req.name}…`)
-    await zipDirectory(localDir, res.filePath)
+    let localDir: string
+    try {
+      localDir = await downloadItem(req.sel, req.path, stageDir)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      // Don't throw to Electron's "Error occurred in handler" logger – report
+      // via progress and return an error payload the renderer can display.
+      progress('download', `Download failed: ${msg}`, 'error')
+      return { canceled: false, error: msg } as unknown as { canceled: boolean; savedTo?: string }
+    }
+    progress('download', `Zipping ${req.name}…`, 'running', 0)
+    try {
+      await zipDirectory(localDir, res.filePath, (pct) => {
+        progress('download', `Zipping ${req.name}… ${pct}%`, 'running', pct)
+      })
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      // Clean up a partial zip
+      await fsp.rm(res.filePath, { force: true }).catch(() => {})
+      progress('download', `Zip failed: ${msg}`, 'error')
+      return { canceled: false, error: `Zip failed: ${msg}` } as unknown as {
+        canceled: boolean
+        savedTo?: string
+      }
+    }
     progress('download', `Saved ${path.basename(res.filePath)}`, 'done')
     return { canceled: false, savedTo: res.filePath }
   } finally {

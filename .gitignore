@@ -25,3 +25,5 @@ desktop.ini
 assets/logo*
 assets/*.icns
 assets/mask*
+
+opencode.json

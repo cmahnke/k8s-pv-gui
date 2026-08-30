@@ -50,6 +50,20 @@
 
     <nav id="breadcrumb" aria-label="Path"></nav>
 
+    <div id="error-banner" hidden role="alert" aria-live="assertive">
+      <div class="error-banner-icon" aria-hidden="true">⎈</div>
+      <div class="error-banner-body">
+        <div id="error-banner-title" class="error-banner-title"></div>
+        <div id="error-banner-detail" class="error-banner-detail"></div>
+        <div id="error-banner-hint" class="error-banner-hint"></div>
+      </div>
+      <div class="error-banner-actions">
+        <button id="error-banner-retry">Retry</button>
+        <button id="error-banner-config">Change kubeconfig…</button>
+        <button id="error-banner-dismiss" class="ghost" aria-label="Dismiss">✕</button>
+      </div>
+    </div>
+
     <main id="file-area">
       <table id="file-table">
         <thead>
@@ -81,6 +95,9 @@
       <span id="status-spinner" class="spinner" hidden></span>
       <span class="spacer"></span>
       <span id="selection-info"></span>
+      <div id="progress-wrap" hidden aria-hidden="true">
+        <div id="progress-bar"></div>
+      </div>
     </footer>
 
     <script src="app.js"></script>

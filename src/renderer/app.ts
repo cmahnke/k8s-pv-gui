@@ -59,18 +59,120 @@ function busy(on: boolean): void {
     !state.currentContext || !state.namespace || !state.pod || !state.mount
 }
 
-window.api.onProgress(({ op, detail, state }) => {
+function setProgress(percent: number | undefined, state: string | undefined): void {
+  const wrap = $<HTMLElement>('#progress-wrap')
+  const bar = $<HTMLElement>('#progress-bar')
+  if (state === 'done' || state === 'error') {
+    // briefly show 100% on done, then hide
+    if (state === 'done' && typeof percent !== 'number') {
+      bar.style.width = '100%'
+      wrap.hidden = false
+      wrap.classList.remove('indeterminate')
+    } else if (typeof percent === 'number') {
+      bar.style.width = `${percent}%`
+    }
+    setTimeout(() => {
+      wrap.hidden = true
+      wrap.classList.remove('indeterminate')
+      bar.style.width = '0'
+      bar.style.transform = ''
+    }, 900)
+    return
+  }
+  if (typeof percent === 'number') {
+    wrap.hidden = false
+    wrap.classList.remove('indeterminate')
+    bar.style.width = `${percent}%`
+  } else if (state === 'running') {
+    wrap.hidden = false
+    wrap.classList.add('indeterminate')
+    bar.style.width = ''
+  } else {
+    wrap.hidden = true
+    wrap.classList.remove('indeterminate')
+  }
+}
+
+window.api.onProgress(({ op, detail, state, percent }) => {
   setStatus(
     `${op}: ${detail}`,
     state === 'error' ? 'state-error' : state === 'done' ? 'state-done' : '',
   )
+  setProgress(percent, state)
 })
+
+// ---------------------------------------------------------------------------
+// error banner – beautiful presentation for cluster connection failures
+// ---------------------------------------------------------------------------
+
+let pendingRetry: (() => void) | null = null
+
+function isConnectionErrorMessage(msg: string): boolean {
+  return /connection.*refused|was refused|unable to connect|did you specify the right host|6443.*refused|ECONNREFUSED|connection timed out|network is unreachable|no such host|certificate.*expired|tls.*handshake|dial tcp|cluster unreachable/i.test(
+    msg,
+  )
+}
+
+function hideBanner(): void {
+  $<HTMLElement>('#error-banner').hidden = true
+  pendingRetry = null
+}
+
+function showBanner(opts: {
+  title: string
+  detail: string
+  hint: string
+  retry?: () => void
+}): void {
+  $<HTMLElement>('#error-banner-title').textContent = opts.title
+  $<HTMLElement>('#error-banner-detail').textContent = opts.detail
+  $<HTMLElement>('#error-banner-hint').textContent = opts.hint
+  const banner = $<HTMLElement>('#error-banner')
+  banner.hidden = false
+  pendingRetry = opts.retry ?? null
+  $<HTMLButtonElement>('#error-banner-retry').hidden = !opts.retry
+  // Bring into view on small windows
+  banner.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+}
+
+function wireBannerActions(): void {
+  $<HTMLButtonElement>('#error-banner-retry').addEventListener('click', () => {
+    hideBanner()
+    if (pendingRetry) pendingRetry()
+  })
+  $<HTMLButtonElement>('#error-banner-config').addEventListener('click', () => {
+    hideBanner()
+    void chooseKubeconfig()
+  })
+  $<HTMLButtonElement>('#error-banner-dismiss').addEventListener('click', () => hideBanner())
+}
+wireBannerActions()
 
 // Catch clauses compile to `any` here (useUnknownInCatchVariables is off),
 // so call sites may forward thrown values directly.
-function showError(error: Error | string): void {
+function showError(error: Error | string, retry?: () => void): void {
   console.error(error)
-  setStatus(error instanceof Error ? error.message : error, 'state-error')
+  const raw = error instanceof Error ? error.message : error
+  // Strip the "Cluster unreachable: " prefix we add in main for clean display
+  const detail = raw.replace(/^Cluster unreachable:\s*/i, '').trim() || raw
+  if (isConnectionErrorMessage(raw)) {
+    const kubeHint = state.currentContext
+      ? `Context "${state.currentContext}" points at a server that isn't reachable.`
+      : 'No reachable server found for the current kubeconfig.'
+    showBanner({
+      title: 'Cannot reach Kubernetes cluster',
+      detail,
+      hint:
+        `${kubeHint} ` +
+        'Check that your cluster is running, your kubeconfig points at the right host (e.g. not 127.0.0.1:6443 when the cluster is stopped), and that your network/VPN allows the connection. ' +
+        'You can retry or pick a different kubeconfig.',
+      retry: retry ?? (() => void init()),
+    })
+    setStatus('Cluster unreachable — see banner for details', 'state-error')
+    return
+  }
+  hideBanner()
+  setStatus(raw, 'state-error')
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +181,7 @@ function showError(error: Error | string): void {
 
 async function init(): Promise<void> {
   try {
+    hideBanner()
     const info = await backend.getInfo()
     $('#welcome-kubeconfig').textContent = info.kubeconfig ? `kubeconfig: ${info.kubeconfig}` : ''
     const { contexts, current } = await backend.listContexts()
@@ -88,7 +191,7 @@ async function init(): Promise<void> {
     if (current) await loadNamespaces()
     else setStatus('No kubectl context found', 'state-error')
   } catch (e) {
-    showError(e as Error)
+    showError(e as Error, () => void init())
   }
 }
 
@@ -96,6 +199,7 @@ async function loadNamespaces(): Promise<void> {
   disableAll('#sel-namespace', '#sel-pod', '#sel-mount')
   try {
     busy(true)
+    hideBanner()
     setStatus('Loading namespaces…')
     state.namespaces = await backend.listNamespaces({ context: state.currentContext })
     fillSelect($<HTMLSelectElement>('#sel-namespace'), state.namespaces, state.namespaces[0])
@@ -103,7 +207,7 @@ async function loadNamespaces(): Promise<void> {
     enable('#sel-namespace')
     if (state.namespace) await loadPods()
   } catch (e) {
-    showError(e as Error)
+    showError(e as Error, () => void loadNamespaces())
   } finally {
     busy(false)
   }
@@ -115,6 +219,7 @@ async function loadPods(): Promise<void> {
   if (!state.namespace) return
   try {
     busy(true)
+    hideBanner()
     setStatus('Listing pods with volumes…')
     state.pods = await backend.listPods({
       context: state.currentContext!,
@@ -127,7 +232,7 @@ async function loadPods(): Promise<void> {
     if (state.pod) await loadMounts()
     else setStatus(`No running pods mounting volumes in "${state.namespace}"`, 'state-error')
   } catch (e) {
-    showError(e as Error)
+    showError(e as Error, () => void loadPods())
   } finally {
     busy(false)
   }
@@ -172,6 +277,7 @@ async function navigate(dir: string): Promise<void> {
   if (!sel) return
   try {
     busy(true)
+    hideBanner()
     setStatus(`Loading ${dir} …`)
     const entries = await backend.list(sel, dir)
     state.cwd = dir.replace(/\/+$/, '') || '/'
@@ -182,7 +288,7 @@ async function navigate(dir: string): Promise<void> {
       `${entries.length} item${entries.length === 1 ? '' : 's'} — ${describeMount(state.mount)}`,
     )
   } catch (e) {
-    showError(e as Error)
+    showError(e as Error, () => void navigate(dir))
   } finally {
     busy(false)
   }
@@ -659,8 +765,16 @@ async function downloadEntryAsZip(entry: DirEntry): Promise<void> {
   if (!sel || entry.type !== 'dir') return
   try {
     busy(true)
-    await backend.downloadZip(sel, joinPath(state.cwd, entry.name), entry.name)
-    setStatus(describeMount(state.mount))
+    const res = (await backend.downloadZip(
+      sel,
+      joinPath(state.cwd, entry.name),
+      entry.name,
+    )) as unknown as { canceled: boolean; savedTo?: string; error?: string }
+    if (res?.error) {
+      showError(new Error(res.error))
+      return
+    }
+    if (!res?.canceled) setStatus(describeMount(state.mount))
   } catch (e) {
     showError(e as Error)
   } finally {

@@ -48,6 +48,8 @@ export interface OpProgress {
   op: OpKind
   detail: string
   state?: OpState
+  /** 0-100; when present renderer shows determinate bar, otherwise indeterminate */
+  percent?: number
 }
 
 export interface ContextList {
@@ -83,7 +85,7 @@ export interface Api {
     sel: KubectlTarget,
     path: string,
     name: string,
-  ): Promise<{ canceled: boolean; savedTo?: string }>
+  ): Promise<{ canceled: boolean; savedTo?: string; error?: string }>
   uploadDialog(sel: KubectlTarget, dir: string): Promise<boolean>
   uploadPaths(sel: KubectlTarget, dir: string, paths: string[]): Promise<void>
   dragStart(payload: { sel: KubectlTarget; dir: string; names: string[] }): Promise<boolean>
