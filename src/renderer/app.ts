@@ -1,4 +1,12 @@
-import type { Api, DirEntry, KubectlTarget, MountInfo, PodInfo } from '../shared/types'
+import type {
+  Api,
+  DirEntry,
+  KubectlTarget,
+  MountInfo,
+  MountVolumeResult,
+  PodInfo,
+  UnattachedVolume,
+} from '../shared/types'
 
 // SAFETY: every selector passed here targets a static id/class present in
 // index.html, so querySelector always resolves to the requested element type.
@@ -17,6 +25,7 @@ interface AppState {
   pod: string | null
   mounts: MountInfo[]
   mount: MountInfo | null
+  debugSession: MountVolumeResult | null
   cwd: string
   entries: DirEntry[]
   selection: Set<string>
@@ -32,6 +41,7 @@ const state: AppState = {
   pod: null,
   mounts: [],
   mount: null,
+  debugSession: null,
   cwd: '/',
   entries: [],
   selection: new Set<string>(),
@@ -97,8 +107,7 @@ function busy(on: boolean): void {
   spinnerCount += on ? 1 : -1
   if (spinnerCount < 0) spinnerCount = 0
   $<HTMLElement>('#status-spinner').hidden = spinnerCount === 0
-  $<HTMLButtonElement>('#btn-refresh').disabled =
-    !state.currentContext || !state.namespace || !state.pod || !state.mount
+  $<HTMLButtonElement>('#btn-refresh').disabled = !state.mount
 }
 
 function setProgress(percent: number | undefined, state: string | undefined): void {
@@ -247,6 +256,7 @@ async function loadNamespaces(): Promise<void> {
     fillSelect($<HTMLSelectElement>('#sel-namespace'), state.namespaces, state.namespaces[0])
     state.namespace = state.namespaces[0] || null
     enable('#sel-namespace')
+    setDisabled('#btn-volumes', !state.namespace)
     if (state.namespace) await loadPods()
   } catch (e) {
     showError(e as Error, () => void loadNamespaces())
@@ -301,6 +311,15 @@ async function loadMounts(): Promise<void> {
 }
 
 function mountSel(): KubectlTarget | null {
+  const s = state.debugSession
+  if (s) {
+    return {
+      context: state.currentContext,
+      namespace: s.namespace,
+      pod: s.pod,
+      container: s.container,
+    }
+  }
   if (!state.mount) return null
   return {
     context: state.currentContext,
@@ -308,6 +327,11 @@ function mountSel(): KubectlTarget | null {
     pod: state.pod,
     container: state.mount.container,
   }
+}
+
+/** Mutating operations (upload/delete/rename/mkdir) are blocked in read-only helper sessions. */
+function canMutate(): boolean {
+  return !state.debugSession || !state.debugSession.readOnly
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +361,10 @@ async function navigate(dir: string): Promise<void> {
 }
 
 function describeMount(m: MountInfo | null): string {
+  const s = state.debugSession
+  if (s) {
+    return `${s.volumeLabel} · helper pod ${s.pod}${s.readOnly ? ' (read-only)' : ''}`
+  }
   if (!m) return ''
   const kind =
     m.type === 'pvc' ? `PVC ${m.source}` : m.type === 'hostPath' ? `hostPath ${m.source}` : m.type
@@ -356,7 +384,7 @@ function renderWelcome(): void {
 
 function updateToolbar(): void {
   const ready = !!state.mount && !state.loading
-  $<HTMLButtonElement>('#btn-newfolder').disabled = !ready
+  $<HTMLButtonElement>('#btn-newfolder').disabled = !ready || !canMutate()
   $<HTMLButtonElement>('#btn-refresh').disabled = !ready
 }
 
@@ -640,6 +668,10 @@ async function handleDrop(e: DragEvent, targetDir: string): Promise<void> {
   e.preventDefault()
   e.stopPropagation()
   setDragHint(false)
+  if (!canMutate()) {
+    setStatus('Read-only session — uploads are disabled', 'state-error')
+    return
+  }
   const files = Array.from(e.dataTransfer?.files ?? [])
   const paths = files.map((f) => window.api.pathForFile(f)).filter((p): p is string => !!p)
   if (paths.length === 0) return
@@ -725,13 +757,15 @@ function showEntryMenu(x: number, y: number, entry: DirEntry): void {
     label: many ? `Download ${names.length} items…` : 'Download…',
     action: () => void downloadSelected(names),
   })
-  if (!many) items.push({ label: 'Rename…', action: () => void renameEntry(entry) })
-  items.push('-')
-  items.push({
-    label: many ? `Delete ${names.length} items` : 'Delete',
-    danger: true,
-    action: () => void deleteSelected(names),
-  })
+  if (canMutate()) {
+    if (!many) items.push({ label: 'Rename…', action: () => void renameEntry(entry) })
+    items.push('-')
+    items.push({
+      label: many ? `Delete ${names.length} items` : 'Delete',
+      danger: true,
+      action: () => void deleteSelected(names),
+    })
+  }
   buildMenu(x, y, items)
 }
 
@@ -741,10 +775,15 @@ $('#file-area').addEventListener('contextmenu', (e: MouseEvent) => {
   if (target.closest('.file-row')) return
   if (!state.mount) return
   e.preventDefault()
+  const mutateItems: (MenuItem | '-')[] = canMutate()
+    ? [
+        { label: 'New folder…', action: () => void newFolder() },
+        { label: 'Upload files/folders…', action: () => void uploadViaDialog() },
+        '-',
+      ]
+    : []
   buildMenu(e.clientX, e.clientY, [
-    { label: 'New folder…', action: () => void newFolder() },
-    { label: 'Upload files/folders…', action: () => void uploadViaDialog() },
-    '-',
+    ...mutateItems,
     { label: 'Refresh', action: () => void refresh() },
   ])
 })
@@ -829,6 +868,10 @@ async function downloadEntryAsZip(entry: DirEntry): Promise<void> {
 async function uploadViaDialog(): Promise<void> {
   const sel = mountSel()
   if (!sel) return
+  if (!canMutate()) {
+    setStatus('Read-only session — uploads are disabled', 'state-error')
+    return
+  }
   try {
     busy(true)
     const ok = await backend.uploadDialog(sel, state.cwd)
@@ -841,6 +884,10 @@ async function uploadViaDialog(): Promise<void> {
 }
 
 async function newFolder(): Promise<void> {
+  if (!canMutate()) {
+    setStatus('Read-only session — creating folders is disabled', 'state-error')
+    return
+  }
   const name = await promptModal('New folder', 'Folder name', 'Untitled')
   if (!name) return
   const sel = mountSel()
@@ -856,6 +903,10 @@ async function newFolder(): Promise<void> {
 }
 
 async function renameEntry(entry: DirEntry): Promise<void> {
+  if (!canMutate()) {
+    setStatus('Read-only session — renaming is disabled', 'state-error')
+    return
+  }
   const name = await promptModal('Rename', 'New name', entry.name)
   if (!name || name === entry.name) return
   const sel = mountSel()
@@ -871,6 +922,10 @@ async function renameEntry(entry: DirEntry): Promise<void> {
 }
 
 async function deleteSelected(names: string[]): Promise<void> {
+  if (!canMutate()) {
+    setStatus('Read-only session — deleting is disabled', 'state-error')
+    return
+  }
   const ok = await confirmModal(
     `Delete ${names.length === 1 ? `“${names[0]}”` : `${names.length} items`} from the volume?\n\nThis cannot be undone.`,
   )
@@ -1065,12 +1120,148 @@ function setDisabled(sel: string, disabled: boolean): void {
 }
 
 function resetFileView(): void {
+  endDebugSession()
   state.cwd = '/'
   state.entries = []
   state.selection.clear()
   state.mount = null
   renderAll()
   $<HTMLElement>('#welcome').hidden = false
+}
+
+/** Fire-and-forget teardown of the helper pod session (safe to call twice). */
+function endDebugSession(): void {
+  const s = state.debugSession
+  if (!s) return
+  state.debugSession = null
+  backend.unmountVolumeSync({
+    context: state.currentContext,
+    namespace: s.namespace,
+    pod: s.pod,
+    tempPvc: s.tempPvc,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// unattached volumes dialog
+// ---------------------------------------------------------------------------
+
+let volumeList: UnattachedVolume[] = []
+
+async function openVolumeDialog(): Promise<void> {
+  if (!state.namespace) return
+  $<HTMLElement>('#volume-dialog').hidden = false
+  $<HTMLButtonElement>('#volume-open').disabled = true
+  const wrap = $<HTMLElement>('#volume-list')
+  wrap.innerHTML = ''
+  const hint = document.createElement('p')
+  hint.className = 'volume-empty'
+  hint.textContent = 'Loading unattached volumes…'
+  wrap.appendChild(hint)
+  try {
+    volumeList = await backend.listVolumes({
+      context: state.currentContext,
+      namespace: state.namespace,
+    })
+    renderVolumeList()
+  } catch (e) {
+    $<HTMLElement>('#volume-dialog').hidden = true
+    showError(e as Error, () => void openVolumeDialog())
+  }
+}
+
+function closeVolumeDialog(): void {
+  $<HTMLElement>('#volume-dialog').hidden = true
+}
+
+function renderVolumeList(): void {
+  const wrap = $<HTMLElement>('#volume-list')
+  wrap.innerHTML = ''
+  if (volumeList.length === 0) {
+    const p = document.createElement('p')
+    p.className = 'volume-empty'
+    p.textContent = `No unmounted PVCs in namespace "${state.namespace}" and no Available PVs in the cluster.`
+    wrap.appendChild(p)
+    return
+  }
+  for (const v of volumeList) {
+    const label = document.createElement('label')
+    label.className = 'volume-item'
+    const input = document.createElement('input')
+    input.type = 'radio'
+    input.name = 'unattached-volume'
+    input.value = `${v.kind}:${v.name}`
+    input.addEventListener('change', () => {
+      $<HTMLButtonElement>('#volume-open').disabled = false
+    })
+    const badge = document.createElement('span')
+    badge.className = `badge badge-${v.kind}`
+    badge.textContent = v.kind.toUpperCase()
+    const name = document.createElement('span')
+    name.className = 'volume-name'
+    name.textContent = v.name
+    const meta = document.createElement('span')
+    meta.className = 'volume-meta'
+    meta.textContent = [v.capacity, v.storageClass, v.accessModes.map(shortMode).join('/')]
+      .filter(Boolean)
+      .join(' · ')
+    label.append(input, badge, name, meta)
+    wrap.appendChild(label)
+  }
+}
+
+function shortMode(m: string): string {
+  return m
+    .replace('ReadWriteOncePod', 'RWOP')
+    .replace('ReadWriteMany', 'RWX')
+    .replace('ReadWriteOnce', 'RWO')
+    .replace('ReadOnlyMany', 'ROX')
+}
+
+function selectedVolume(): UnattachedVolume | null {
+  const checked = document.querySelector<HTMLInputElement>(
+    'input[name="unattached-volume"]:checked',
+  )
+  if (!checked) return null
+  const [kind, name] = checked.value.split(':')
+  return volumeList.find((v) => v.kind === kind && v.name === name) ?? null
+}
+
+async function openSelectedVolume(): Promise<void> {
+  const vol = selectedVolume()
+  const namespace = state.namespace
+  if (!vol || !namespace) return
+  const readOnly = $<HTMLInputElement>('#volume-readonly').checked
+  closeVolumeDialog()
+  try {
+    busy(true)
+    setStatus('Creating helper pod…')
+    const session = await backend.mountVolume({
+      context: state.currentContext,
+      namespace,
+      kind: vol.kind,
+      name: vol.name,
+      readOnly,
+    })
+    state.debugSession = session
+    // Synthetic mount so breadcrumb, welcome and toolbar behave like a normal source
+    state.mount = {
+      id: `helper:${session.pod}`,
+      container: session.container,
+      volume: session.volumeLabel,
+      mountPath: session.mountRoot,
+      subPath: '',
+      type: 'pvc',
+      source: session.volumeLabel,
+    }
+    state.cwd = session.mountRoot
+    renderAll()
+    await navigate(session.mountRoot)
+  } catch (e) {
+    showError(e as Error)
+  } finally {
+    busy(false)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,14 +1274,17 @@ function selectValue(e: Event): string | null {
 }
 
 $<HTMLSelectElement>('#sel-context').addEventListener('change', async (e) => {
+  endDebugSession()
   state.currentContext = selectValue(e) || null
   await loadNamespaces()
 })
 $<HTMLSelectElement>('#sel-namespace').addEventListener('change', async (e) => {
+  endDebugSession()
   state.namespace = selectValue(e) || null
   await loadPods()
 })
 $<HTMLSelectElement>('#sel-pod').addEventListener('change', async (e) => {
+  endDebugSession()
   state.pod = selectValue(e) || null
   await loadMounts()
 })
@@ -1101,10 +1295,17 @@ $<HTMLSelectElement>('#sel-mount').addEventListener('change', async (e) => {
 })
 
 $<HTMLButtonElement>('#btn-kubeconfig').addEventListener('click', () => void chooseKubeconfig())
+$<HTMLButtonElement>('#btn-volumes').addEventListener('click', () => void openVolumeDialog())
+$<HTMLButtonElement>('#volume-cancel').addEventListener('click', closeVolumeDialog)
+$<HTMLButtonElement>('#volume-open').addEventListener('click', () => void openSelectedVolume())
 $<HTMLButtonElement>('#btn-refresh').addEventListener('click', () => void refresh())
 $<HTMLButtonElement>('#btn-newfolder').addEventListener('click', () => void newFolder())
 
 window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$<HTMLElement>('#volume-dialog').hidden) {
+    e.preventDefault()
+    closeVolumeDialog()
+  }
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') {
     e.preventDefault()
     void refresh()
@@ -1129,5 +1330,18 @@ window.addEventListener('keydown', (e) => {
 
 // exposed for console debugging and automated tests
 window.__fm = { state, navigate, refresh, renderAll, backend }
+
+// best-effort teardown of a helper pod session when the window goes away
+window.addEventListener('beforeunload', () => {
+  const s = state.debugSession
+  if (s) {
+    backend.unmountVolumeSync({
+      context: state.currentContext,
+      namespace: s.namespace,
+      pod: s.pod,
+      tempPvc: s.tempPvc,
+    })
+  }
+})
 
 void init()

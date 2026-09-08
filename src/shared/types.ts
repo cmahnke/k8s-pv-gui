@@ -43,7 +43,7 @@ export interface DirEntry {
   gid?: number
 }
 
-export type OpKind = 'download' | 'upload' | 'delete' | 'drag' | 'open'
+export type OpKind = 'download' | 'upload' | 'delete' | 'drag' | 'open' | 'mount'
 export type OpState = 'running' | 'done' | 'error'
 
 /** Progress message pushed from main to the renderer. */
@@ -58,6 +58,45 @@ export interface OpProgress {
 export interface ContextList {
   contexts: string[]
   current: string | null
+}
+
+/** A PVC not mounted by any running pod, or an unbound (Available) PV. */
+export interface UnattachedVolume {
+  kind: 'pvc' | 'pv'
+  name: string
+  /** PVCs are namespaced; PVs are cluster-scoped. */
+  namespace: string | null
+  capacity: string
+  storageClass: string
+  accessModes: string[]
+}
+
+export interface MountVolumeRequest {
+  context: string | null
+  /** Namespace the helper pod (and, for PVs, the temp PVC) lives in. */
+  namespace: string
+  kind: 'pvc' | 'pv'
+  name: string
+  readOnly: boolean
+}
+
+export interface MountVolumeResult {
+  pod: string
+  namespace: string
+  container: string
+  /** Path the volume is mounted at inside the helper pod. */
+  mountRoot: string
+  /** Temp PVC backing a PV session; deleted together with the pod. */
+  tempPvc: string | null
+  volumeLabel: string
+  readOnly: boolean
+}
+
+export interface UnmountVolumeRequest {
+  context: string | null
+  namespace: string
+  pod: string
+  tempPvc: string | null
 }
 
 export interface AppInfo {
@@ -79,6 +118,11 @@ export interface Api {
   listContexts(): Promise<ContextList>
   listNamespaces(opts: { context: string | null }): Promise<string[]>
   listPods(opts: { context: string | null; namespace: string }): Promise<PodInfo[]>
+  listVolumes(opts: { context: string | null; namespace: string }): Promise<UnattachedVolume[]>
+  mountVolume(req: MountVolumeRequest): Promise<MountVolumeResult>
+  unmountVolume(req: UnmountVolumeRequest): Promise<void>
+  /** Fire-and-forget unmount (plain `send`) for use during page unload. */
+  unmountVolumeSync(req: UnmountVolumeRequest): void
   list(sel: KubectlTarget, path: string): Promise<DirEntry[]>
   mkdir(sel: KubectlTarget, dir: string, name: string): Promise<string>
   rename(sel: KubectlTarget, dir: string, from: string, to: string): Promise<boolean>

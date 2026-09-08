@@ -2,7 +2,9 @@
 
 An Electron file manager for Kubernetes volumes. Browse the contents of any
 PVC, `hostPath` or `emptyDir` volume mounted by a running pod — and copy
-files in and out via drag & drop.
+files in and out via drag & drop. Volumes that are **not** attached to any
+pod (unmounted PVCs and unbound PVs) can be opened through a temporary
+helper pod.
 
 ## How it works
 
@@ -19,11 +21,32 @@ It uses your existing kubeconfig (`~/.kube/config`, `KUBECONFIG`, in-cluster
 configs are untouched). The pods list is filtered to _Running_ pods that
 mount at least one interesting volume.
 
+## Unattached volumes (helper pod)
+
+The **Volumes…** toolbar button lists PVCs that no running pod mounts, plus
+cluster PVs in `Available` state. Opening one:
+
+1. For a PV, a temporary PVC (`k8s-pv-gui-tmp-…`, pinned via
+   `spec.volumeName`) is created and waited for until `Bound`.
+2. A temporary **helper pod** (`k8s-pv-gui-helper-…`, by default
+   `busybox:latest`, running as root) is created with the volume mounted at
+   `/data`, and the app browses it like any pod.
+3. The helper pod (and temp PVC) is deleted automatically when you switch
+   context/namespace/pod, close the window, or quit. Stale helpers from
+   crashed sessions are swept (by the `app.kubernetes.io/managed-by=k8s-pv-gui`
+   label **and** the `k8s-pv-gui-helper-` name prefix) when listing volumes.
+
+Read-only mounting is available per session; while active, upload, delete,
+rename and new-folder are disabled.
+
 ## Requirements
 
 - Node.js ≥ 18
 - A `kubectl` binary on your `PATH`
 - RBAC allowing `get pods` in the namespace and `create pods/exec`
+- For unattached volumes additionally: `create`/`delete` **pods** (and
+  `get`/`create`/`delete` **persistentvolumeclaims** when browsing free PVs,
+  plus `get persistentvolumes` cluster-wide)
 
 ## Command line options
 
@@ -36,6 +59,10 @@ Options:
   -k, --kubeconfig <file>     Use this kubeconfig file instead of the default
                               (~/.kube/config, honoring $KUBECONFIG).
                               Also accepts --kubeconfig=<file>.
+  --helper-image <image>      Container image for the temporary helper pod
+                              used to browse unattached volumes (needs a
+                              shell and coreutils, default: busybox:latest).
+                              Also accepts --helper-image=<image>.
 ```
 
 Examples:
@@ -43,6 +70,7 @@ Examples:
 ```sh
 npm start -- --kubeconfig ~/clusters/staging.yaml
 ./dist/K8sVolumeExplorer --kubeconfig=/etc/rancher/kubeconfig.yaml
+./dist/K8sVolumeExplorer --helper-image=registry.internal/ops/busybox:1.36
 ```
 
 Without `--kubeconfig`, kubectl's own default resolution applies
@@ -138,6 +166,7 @@ publishing a GitHub release.
 | Open locally                 | Double-click a file (staged to a temp dir)                                                                                                 |
 | New folder / Rename / Delete | Right-click menu                                                                                                                           |
 | Switch kubeconfig            | ⛁ Config… button (validated with kubectl before switching), or `--kubeconfig` at launch                                                    |
+| Open unattached volume       | Volumes… button → pick PVC/PV → Open (temporary helper pod, auto-deleted)                                                                  |
 | Multi-select                 | ⌘-click, ⌘A                                                                                                                                |
 | Go up                        | ⌫                                                                                                                                          |
 
@@ -151,3 +180,10 @@ publishing a GitHub release.
 - Dragging out stages files in a temp directory first, so there's a delay
   before the OS drag starts; keep holding the mouse button.
 - Deleted files bypass any trash — they're gone.
+- Helper pods run as root and need an image with a shell reachable from the
+  cluster; use `--helper-image` for air-gapped/internal registries. Namespaces
+  with a restricted Pod Security level will reject the helper pod.
+- `hostPath`-typed PVs carry no node information, so the helper pod may
+  schedule on the wrong node and fail to see the volume.
+- Released/Failed PVs (bound to a claim) are not `Available` and are not
+  listed.

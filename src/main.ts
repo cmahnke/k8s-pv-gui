@@ -1,9 +1,9 @@
-import { execFile, spawn } from 'child_process'
+import { execFile, spawn, spawnSync } from 'child_process'
 import fs from 'fs'
 import fsp from 'fs/promises'
 import os from 'os'
 import path from 'path'
-import type { IpcMainInvokeEvent } from 'electron'
+import type { IpcMainEvent, IpcMainInvokeEvent } from 'electron'
 import { app, BrowserWindow, ipcMain, dialog, nativeImage, shell } from 'electron'
 import { ZipArchive } from 'archiver'
 import type {
@@ -11,10 +11,14 @@ import type {
   DirEntry,
   KubectlTarget,
   MountInfo,
+  MountVolumeRequest,
+  MountVolumeResult,
   OpKind,
   OpProgress,
   OpState,
   PodInfo,
+  UnattachedVolume,
+  UnmountVolumeRequest,
 } from './shared/types'
 
 let mainWindow: Electron.BrowserWindow | null = null
@@ -45,6 +49,10 @@ Options:
   -k, --kubeconfig <file>     Use this kubeconfig file instead of the default
                               (~/.kube/config, honoring $KUBECONFIG).
                               Also accepts --kubeconfig=<file>.
+  --helper-image <image>      Container image for the temporary helper pod used
+                              to browse unattached volumes (needs a shell and
+                              coreutils, default: busybox:latest).
+                              Also accepts --helper-image=<image>.
 
 Examples:
   npm start -- --kubeconfig ~/clusters/staging.yaml
@@ -55,10 +63,11 @@ Everything else happens in the app window.`
 interface CliArgs {
   help: boolean
   kubeconfig: string | null
+  helperImage: string | null
 }
 
 function parseCliArgs(argv: string[]): CliArgs {
-  const opts: CliArgs = { help: false, kubeconfig: null }
+  const opts: CliArgs = { help: false, kubeconfig: null, helperImage: null }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!
     if (a === '-h' || a === '--help') {
@@ -70,6 +79,13 @@ function parseCliArgs(argv: string[]): CliArgs {
       }
     } else if (a.startsWith('--kubeconfig=')) {
       opts.kubeconfig = a.slice('--kubeconfig='.length)
+    } else if (a === '--helper-image') {
+      opts.helperImage = argv[++i] ?? null
+      if (!opts.helperImage || opts.helperImage.startsWith('-')) {
+        fail('error: --helper-image requires an image reference')
+      }
+    } else if (a.startsWith('--helper-image=')) {
+      opts.helperImage = a.slice('--helper-image='.length)
     } else if (/^-psn_/i.test(a)) {
       // legacy macOS launchd "-psn_..." argument, ignore
     } else {
@@ -98,6 +114,9 @@ if (cli.kubeconfig && !fs.existsSync(cli.kubeconfig)) {
 // Runtime-mutable: starts from --kubeconfig CLI arg, may be changed via the
 // in-app picker. All kubectl invocations read it at call time.
 let activeKubeconfig: string | null = cli.kubeconfig
+
+// Container image for the temporary helper pod browsing unattached volumes.
+const activeHelperImage: string = cli.helperImage ?? 'busybox:latest'
 
 function kubeconfigArgs(configFile: string | null = activeKubeconfig): string[] {
   return configFile ? ['--kubeconfig', configFile] : []
@@ -281,8 +300,26 @@ interface RawContainer {
 }
 interface RawPod {
   metadata: { name: string; deletionTimestamp?: string }
-  status: { phase: string }
+  status: { phase: string; containerStatuses?: { ready?: boolean }[] }
   spec: { containers: RawContainer[]; volumes?: RawVolume[] }
+}
+interface RawPvc {
+  metadata: { name: string; namespace?: string; deletionTimestamp?: string }
+  status: { phase: string }
+  spec: {
+    accessModes?: string[]
+    storageClassName?: string
+    resources?: { requests?: { storage?: string } }
+  }
+}
+interface RawPv {
+  metadata: { name: string; deletionTimestamp?: string }
+  status: { phase: string }
+  spec: {
+    accessModes?: string[]
+    storageClassName?: string
+    capacity?: { storage?: string }
+  }
 }
 
 const BROWSABLE_TYPES = ['pvc', 'hostPath', 'emptyDir']
@@ -343,6 +380,371 @@ function collectMounts(pod: RawPod): MountInfo[] {
     }
   }
   return mounts.filter((m) => BROWSABLE_TYPES.includes(m.type))
+}
+
+// ---------------------------------------------------------------------------
+// unattached volumes: temporary helper pods
+// ---------------------------------------------------------------------------
+
+const HELPER_LABEL = 'app.kubernetes.io/managed-by=k8s-pv-gui'
+const HELPER_LABEL_KEY = 'app.kubernetes.io/managed-by'
+const HELPER_LABEL_VALUE = 'k8s-pv-gui'
+const HELPER_PREFIX = 'k8s-pv-gui-helper'
+const TMP_PVC_PREFIX = 'k8s-pv-gui-tmp'
+const HELPER_MOUNT_ROOT = '/data'
+
+interface ActiveHelper {
+  context: string | null
+  namespace: string
+  pod: string
+  tempPvc: string | null
+}
+
+// Helpers created during this app session; deleted on quit or explicit unmount.
+const activeHelpers = new Map<string, ActiveHelper>()
+
+function rand6(): string {
+  return Math.random().toString(36).slice(2, 8)
+}
+
+/** Reduce a volume name to a DNS-1123 safe fragment. */
+function dnsFragment(s: string): string {
+  const frag = s
+    .toLowerCase()
+    .replace(/[^a-z0-9.-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40)
+  return frag || 'vol'
+}
+
+async function listUnattachedVolumes({
+  context,
+  namespace,
+}: {
+  context: string | null
+  namespace: string
+}): Promise<UnattachedVolume[]> {
+  // Helpers left over from a previous session would linger forever: sweep
+  // them (label selector + name prefix guard) for the namespace being browsed.
+  void sweepStaleHelpers(context, namespace)
+
+  const ctxArgs = context ? ['--context', context] : []
+  const [podsOut, pvcOut, pvOut] = await Promise.all([
+    runKubectl([...ctxArgs, '-n', namespace, 'get', 'pods', '-o', 'json']),
+    runKubectl([...ctxArgs, '-n', namespace, 'get', 'pvc', '-o', 'json']),
+    runKubectl([...ctxArgs, 'get', 'pv', '-o', 'json']),
+  ])
+
+  const pods: { items: RawPod[] } = JSON.parse(podsOut)
+  const inUse = new Set<string>()
+  for (const p of pods.items) {
+    if (p.status.phase !== 'Running' || p.metadata.deletionTimestamp !== undefined) continue
+    for (const v of p.spec.volumes ?? []) {
+      if (v.persistentVolumeClaim) inUse.add(v.persistentVolumeClaim.claimName)
+    }
+  }
+
+  const pvcs: { items: RawPvc[] } = JSON.parse(pvcOut)
+  const pvcEntries: UnattachedVolume[] = pvcs.items
+    .filter((p) => p.metadata.deletionTimestamp === undefined && !inUse.has(p.metadata.name))
+    .map((p) => ({
+      kind: 'pvc',
+      name: p.metadata.name,
+      namespace: p.metadata.namespace ?? namespace,
+      capacity: p.spec.resources?.requests?.storage ?? '',
+      storageClass: p.spec.storageClassName ?? '',
+      accessModes: p.spec.accessModes ?? [],
+    }))
+
+  const pvs: { items: RawPv[] } = JSON.parse(pvOut)
+  const pvEntries: UnattachedVolume[] = pvs.items
+    .filter((p) => p.status.phase === 'Available' && p.metadata.deletionTimestamp === undefined)
+    .map((p) => ({
+      kind: 'pv',
+      name: p.metadata.name,
+      namespace: null,
+      capacity: p.spec.capacity?.storage ?? '',
+      storageClass: p.spec.storageClassName ?? '',
+      accessModes: p.spec.accessModes ?? [],
+    }))
+
+  const byName = (a: UnattachedVolume, b: UnattachedVolume): number => a.name.localeCompare(b.name)
+  return [...pvcEntries.sort(byName), ...pvEntries.sort(byName)]
+}
+
+async function sweepStaleHelpers(context: string | null, namespace: string): Promise<void> {
+  const ctxArgs = context ? ['--context', context] : []
+  try {
+    const out = await runKubectl(
+      [
+        ...ctxArgs,
+        '-n',
+        namespace,
+        'get',
+        'pods',
+        '-l',
+        HELPER_LABEL,
+        '-o',
+        'jsonpath={.items[*].metadata.name}',
+      ],
+      { timeout: 15000 },
+    )
+    const names = out.split(/\s+/).filter((n) => n.startsWith(`${HELPER_PREFIX}-`))
+    for (const name of names) {
+      await deleteResource(ctxArgs, namespace, 'pod', name)
+    }
+  } catch {
+    // sweeping is best effort
+  }
+}
+
+async function deleteResource(
+  ctxArgs: string[],
+  namespace: string,
+  kind: 'pod' | 'persistentvolumeclaim',
+  name: string,
+): Promise<void> {
+  await runKubectl(
+    [...ctxArgs, '-n', namespace, 'delete', kind, name, '--ignore-not-found', '--wait=false'],
+    { timeout: 30000 },
+  ).catch(() => {})
+}
+
+async function applyManifest(
+  context: string | null,
+  namespace: string,
+  manifest: object,
+): Promise<void> {
+  // execFile has no stdin support, so the manifest goes through a temp file
+  const file = path.join(os.tmpdir(), `k8s-pv-gui-${rand6()}.json`)
+  try {
+    await fsp.writeFile(file, JSON.stringify(manifest))
+    await runKubectl(
+      [...(context ? ['--context', context] : []), '-n', namespace, 'create', '-f', file],
+      { timeout: 30000 },
+    )
+  } finally {
+    fsp.rm(file, { force: true }).catch(() => {})
+  }
+}
+
+function buildTempPvcManifest(name: string, pv: RawPv): object {
+  return {
+    apiVersion: 'v1',
+    kind: 'PersistentVolumeClaim',
+    metadata: { name },
+    spec: {
+      accessModes: pv.spec.accessModes ?? ['ReadWriteOnce'],
+      volumeName: pv.metadata.name,
+      ...(pv.spec.storageClassName ? { storageClassName: pv.spec.storageClassName } : {}),
+      resources: { requests: { storage: pv.spec.capacity?.storage ?? '1Gi' } },
+    },
+  }
+}
+
+function buildHelperPodManifest(opts: {
+  name: string
+  claimName: string
+  image: string
+  readOnly: boolean
+  volumeLabel: string
+}): object {
+  return {
+    apiVersion: 'v1',
+    kind: 'Pod',
+    metadata: {
+      name: opts.name,
+      labels: { [HELPER_LABEL_KEY]: HELPER_LABEL_VALUE },
+      annotations: { 'k8s-pv-gui/volume': opts.volumeLabel },
+    },
+    spec: {
+      restartPolicy: 'Never',
+      terminationGracePeriodSeconds: 0,
+      // root is required to read files owned by arbitrary uids on the volume
+      securityContext: { runAsUser: 0, runAsGroup: 0 },
+      containers: [
+        {
+          name: 'data',
+          image: opts.image,
+          command: ['tail', '-f', '/dev/null'],
+          volumeMounts: [{ name: 'vol', mountPath: HELPER_MOUNT_ROOT, readOnly: opts.readOnly }],
+        },
+      ],
+      volumes: [{ name: 'vol', persistentVolumeClaim: { claimName: opts.claimName } }],
+    },
+  }
+}
+
+/** Poll until fn() returns true; Forbidden errors abort immediately. */
+async function waitForCondition(
+  fn: () => Promise<boolean>,
+  timeoutMs: number,
+  failMsg: string,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      if (await fn()) return
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (/forbidden/i.test(msg)) throw e
+      // transient kubectl errors during resource startup shouldn't abort the wait
+    }
+    await new Promise((r) => setTimeout(r, 2000))
+  }
+  throw new Error(`Timed out: ${failMsg}`)
+}
+
+async function diagnosePod(ctxArgs: string[], namespace: string, pod: string): Promise<string> {
+  try {
+    return (
+      await runKubectl(
+        [
+          ...ctxArgs,
+          '-n',
+          namespace,
+          'get',
+          'events',
+          '--field-selector',
+          `involvedObject.name=${pod}`,
+          '-o',
+          'jsonpath={range .items[*]}{.message}{"\\n"}{end}',
+        ],
+        { timeout: 15000 },
+      )
+    ).trim()
+  } catch {
+    return ''
+  }
+}
+
+function enrichMountError(e: Error, req: MountVolumeRequest): Error {
+  if (/forbidden/i.test(e.message)) {
+    return new Error(
+      `The cluster denied a required operation. Browsing unattached volumes needs RBAC ` +
+        `permissions to create and delete pods` +
+        (req.kind === 'pv' ? ' and persistentvolumeclaims' : '') +
+        `.\nDetail: ${e.message}`,
+    )
+  }
+  return e
+}
+
+async function mountVolume(req: MountVolumeRequest): Promise<MountVolumeResult> {
+  const ctxArgs = req.context ? ['--context', req.context] : []
+  const rand = rand6()
+  let tempPvc: string | null = null
+  let podName: string | null = null
+
+  try {
+    let claimName: string
+    const volumeLabel = req.kind === 'pv' ? `pv/${req.name}` : `pvc/${req.name}`
+    if (req.kind === 'pv') {
+      // A PV cannot be mounted directly: bind a temp PVC pinned via
+      // spec.volumeName, then mount that claim in the helper pod.
+      const out = await runKubectl([...ctxArgs, 'get', 'pv', req.name, '-o', 'json'])
+      const pv: RawPv = JSON.parse(out)
+      tempPvc = `${TMP_PVC_PREFIX}-${dnsFragment(req.name)}-${rand}`
+      await applyManifest(req.context, req.namespace, buildTempPvcManifest(tempPvc, pv))
+      progress('mount', `Waiting for PVC ${tempPvc} to bind…`)
+      await waitForCondition(
+        async () => {
+          const raw = await runKubectl([
+            ...ctxArgs,
+            '-n',
+            req.namespace,
+            'get',
+            'pvc',
+            tempPvc!,
+            '-o',
+            'json',
+          ])
+          const pvc: RawPvc = JSON.parse(raw)
+          return pvc.status.phase === 'Bound'
+        },
+        60000,
+        `PVC ${tempPvc} did not become Bound`,
+      )
+      claimName = tempPvc
+    } else {
+      claimName = req.name
+    }
+
+    podName = `${HELPER_PREFIX}-${rand}`
+    await applyManifest(
+      req.context,
+      req.namespace,
+      buildHelperPodManifest({
+        name: podName,
+        claimName,
+        image: activeHelperImage,
+        readOnly: req.readOnly,
+        volumeLabel,
+      }),
+    )
+
+    progress('mount', `Waiting for helper pod ${podName}…`)
+    await waitForCondition(
+      async () => {
+        const raw = await runKubectl([
+          ...ctxArgs,
+          '-n',
+          req.namespace,
+          'get',
+          'pod',
+          podName!,
+          '-o',
+          'json',
+        ])
+        const pod: RawPod = JSON.parse(raw)
+        return (
+          pod.metadata.deletionTimestamp === undefined &&
+          pod.status.phase === 'Running' &&
+          (pod.status.containerStatuses?.every((c) => c.ready === true) ?? false)
+        )
+      },
+      120000,
+      `helper pod ${podName} did not become Ready`,
+    )
+
+    const result: MountVolumeResult = {
+      pod: podName,
+      namespace: req.namespace,
+      container: 'data',
+      mountRoot: HELPER_MOUNT_ROOT,
+      tempPvc,
+      volumeLabel,
+      readOnly: req.readOnly,
+    }
+    activeHelpers.set(podName, {
+      context: req.context,
+      namespace: req.namespace,
+      pod: podName,
+      tempPvc,
+    })
+    progress('mount', `Helper pod ${podName} ready`, 'done')
+    return result
+  } catch (e) {
+    const err = e instanceof Error ? e : new Error(String(e))
+    let final = err
+    if (err.message.startsWith('Timed out') && podName) {
+      const diag = await diagnosePod(ctxArgs, req.namespace, podName)
+      if (diag) final = new Error(`${err.message}\nPod events: ${diag}`)
+    }
+    // roll back partial resources; the session never started
+    if (podName) void deleteResource(ctxArgs, req.namespace, 'pod', podName)
+    if (tempPvc) void deleteResource(ctxArgs, req.namespace, 'persistentvolumeclaim', tempPvc)
+    throw enrichMountError(final, req)
+  }
+}
+
+async function unmountVolume(req: UnmountVolumeRequest): Promise<void> {
+  const ctxArgs = req.context ? ['--context', req.context] : []
+  activeHelpers.delete(req.pod)
+  await deleteResource(ctxArgs, req.namespace, 'pod', req.pod)
+  if (req.tempPvc) {
+    await deleteResource(ctxArgs, req.namespace, 'persistentvolumeclaim', req.tempPvc)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,7 +1134,6 @@ interface UploadPathsRequest {
 interface OpenStagedRequest {
   localPath: string
 }
-
 function registerIpc(): void {
   ipcMain.handle('k8s:listContexts', (): Promise<ContextList> => listContexts())
 
@@ -744,6 +1145,28 @@ function registerIpc(): void {
     'k8s:listPods',
     (_e: IpcMainInvokeEvent, opts: { context: string | null; namespace: string }) => listPods(opts),
   )
+
+  ipcMain.handle(
+    'k8s:listVolumes',
+    (_e: IpcMainInvokeEvent, opts: { context: string | null; namespace: string }) =>
+      listUnattachedVolumes(opts),
+  )
+
+  ipcMain.handle(
+    'k8s:mountVolume',
+    (_e: IpcMainInvokeEvent, req: MountVolumeRequest): Promise<MountVolumeResult> =>
+      mountVolume(req),
+  )
+
+  ipcMain.handle(
+    'k8s:unmountVolume',
+    (_e: IpcMainInvokeEvent, req: UnmountVolumeRequest): Promise<void> => unmountVolume(req),
+  )
+
+  // fire-and-forget variant used by the renderer while unloading
+  ipcMain.on('k8s:unmountVolumeSync', (_e: IpcMainEvent, req: UnmountVolumeRequest) => {
+    void unmountVolume(req).catch(() => {})
+  })
 
   ipcMain.handle('fs:list', (_e: IpcMainInvokeEvent, req: ListRequest) =>
     listDir(req.sel, req.path),
@@ -1089,4 +1512,30 @@ app.on('window-all-closed', () => {
 
 app.on('will-quit', () => {
   if (stagingRoot) fsp.rm(stagingRoot, { recursive: true, force: true }).catch(() => {})
+  // Blocking backstop for helper pods: the renderer normally unmounts via
+  // k8s:unmountVolumeSync on unload, but that must not be trusted at quit time.
+  for (const helper of activeHelpers.values()) {
+    const base = [
+      ...kubeconfigArgs(),
+      ...(helper.context ? ['--context', helper.context] : []),
+      '-n',
+      helper.namespace,
+      'delete',
+    ]
+    try {
+      spawnSync('kubectl', [...base, 'pod', helper.pod, '--ignore-not-found', '--wait=false'], {
+        timeout: 5000,
+        env: kubectlEnv(),
+      })
+      if (helper.tempPvc) {
+        spawnSync(
+          'kubectl',
+          [...base, 'persistentvolumeclaim', helper.tempPvc, '--ignore-not-found', '--wait=false'],
+          { timeout: 5000, env: kubectlEnv() },
+        )
+      }
+    } catch {
+      // best effort at quit time
+    }
+  }
 })

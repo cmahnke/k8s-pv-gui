@@ -1,11 +1,21 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { IpcRendererEvent } from 'electron'
-import type { Api, KubectlTarget, OpProgress } from './shared/types'
+import type {
+  Api,
+  KubectlTarget,
+  MountVolumeRequest,
+  OpProgress,
+  UnmountVolumeRequest,
+} from './shared/types'
 
 const api: Api = {
   listContexts: () => ipcRenderer.invoke('k8s:listContexts'),
   listNamespaces: (opts) => ipcRenderer.invoke('k8s:listNamespaces', opts),
   listPods: (opts) => ipcRenderer.invoke('k8s:listPods', opts),
+  listVolumes: (opts) => ipcRenderer.invoke('k8s:listVolumes', opts),
+  mountVolume: (req: MountVolumeRequest) => ipcRenderer.invoke('k8s:mountVolume', req),
+  unmountVolume: (req: UnmountVolumeRequest) => ipcRenderer.invoke('k8s:unmountVolume', req),
+  unmountVolumeSync: (req: UnmountVolumeRequest) => ipcRenderer.send('k8s:unmountVolumeSync', req),
   list: (sel: KubectlTarget, p: string) => ipcRenderer.invoke('fs:list', { sel, path: p }),
   mkdir: (sel, dir, name) => ipcRenderer.invoke('fs:mkdir', { sel, dir, name }),
   rename: (sel, dir, from, to) => ipcRenderer.invoke('fs:rename', { sel, dir, from, to }),
