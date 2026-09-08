@@ -179,6 +179,14 @@ button:disabled {
   color: var(--text-dim);
 }
 
+.col-uid,
+.col-gid {
+  width: 110px;
+  color: var(--text-dim);
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+}
+
 .col-perms {
   width: 110px;
   color: var(--text-dim);
@@ -563,6 +571,12 @@ tr.file-row.drop-target td {
 
 #status-text.state-error {
   color: var(--danger);
+  cursor: pointer;
+}
+
+#status-text.state-error:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 #status-text.state-done {

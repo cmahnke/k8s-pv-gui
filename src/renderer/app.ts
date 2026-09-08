@@ -48,7 +48,49 @@ function setStatus(text: string, cls = ''): void {
   const el = $('#status-text')
   el.textContent = text
   el.className = cls
+  const isError = cls.includes('state-error')
+  el.title = isError && text ? 'Click to copy error' : ''
 }
+
+let statusRestoreTimer: ReturnType<typeof setTimeout> | null = null
+
+function wireStatusCopy(): void {
+  $('#status-text').addEventListener('click', async () => {
+    const el = $('#status-text')
+    if (!el.classList.contains('state-error')) return
+    const text = el.textContent?.trim()
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      // fallback for environments where Clipboard API is unavailable
+      const ta = document.createElement('textarea')
+      ta.value = text
+      ta.style.position = 'fixed'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.focus()
+      ta.select()
+      try {
+        document.execCommand('copy')
+      } finally {
+        ta.remove()
+      }
+    }
+    const original = text
+    const originalCls = el.className
+    if (statusRestoreTimer) clearTimeout(statusRestoreTimer)
+    setStatus('Copied to clipboard ✓', 'state-done')
+    statusRestoreTimer = setTimeout(() => {
+      // only restore if still showing the confirmation
+      if ($('#status-text').textContent === 'Copied to clipboard ✓') {
+        setStatus(original, originalCls)
+      }
+      statusRestoreTimer = null
+    }, 1500)
+  })
+}
+wireStatusCopy()
 
 function busy(on: boolean): void {
   state.loading = on
@@ -408,6 +450,8 @@ function buildRow(entry: DirEntry): HTMLTableRowElement {
     }</span></td>
     <td class="col-size">${entry.type === 'dir' ? '—' : formatSize(entry.size)}</td>
     <td class="col-date">${formatDate(entry.modified)}</td>
+    <td class="col-uid">${formatUidGid(entry.uid, entry.owner)}</td>
+    <td class="col-gid">${formatUidGid(entry.gid, entry.group)}</td>
     <td class="col-perms">${entry.perms}</td>`
 
   tr.addEventListener('mousedown', (e) => handleRowMouseDown(e, tr, entry))
@@ -982,6 +1026,13 @@ function formatDate(ts: number | null): string {
   const d = new Date(ts)
   const pad = (x: number): string => String(x).padStart(2, '0')
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+function formatUidGid(id: number | undefined, name: string): string {
+  if (id !== undefined) {
+    return name && name !== String(id) ? `${id} (${name})` : String(id)
+  }
+  return name || '—'
 }
 
 type SelectItem = string | [string, string]

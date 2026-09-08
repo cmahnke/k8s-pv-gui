@@ -103,6 +103,16 @@ function kubeconfigArgs(configFile: string | null = activeKubeconfig): string[] 
   return configFile ? ['--kubeconfig', configFile] : []
 }
 
+function kubectlEnv(): NodeJS.ProcessEnv {
+  // Force SPDY for all kubectl subprocesses. Since K8s 1.30 kubectl defaults
+  // to WebSockets (KUBECTL_REMOTE_COMMAND_WEBSOCKETS=true) which triggers
+  // known bugs: `v2.go:167 read message: %!w(<nil>)` / `close 1006` / `i/o timeout`
+  // on large `kubectl cp` / `kubectl exec tar` transfers, especially behind
+  // Rancher/proxy/LB (k8s#130634, k8s#60140, rancher#52003). SPDY is stable and
+  // the env is scoped to child processes only.
+  return { ...process.env, KUBECTL_REMOTE_COMMAND_WEBSOCKETS: 'false' }
+}
+
 // ---------------------------------------------------------------------------
 // kubectl helpers
 // ---------------------------------------------------------------------------
@@ -122,6 +132,20 @@ function isUnexpectedEofError(msg: string): boolean {
   return /unexpected EOF/i.test(msg)
 }
 
+function isWebSocketStreamError(msg: string): boolean {
+  // WebSocket remotecommand errors from client-go v2.go. The `%!w(<nil>)` is
+  // the nil-wrap bug fixed in k8s#130635; the underlying causes are
+  // `close 1006`, `i/o timeout`, `next reader: ...`.
+  // Keep broad but specific to this known failure mode.
+  return /read message.*%!w|error reading from (error|data) stream|v2\.go.*read message|websocket: close 1006|next reader:.*i\/o timeout/i.test(
+    msg,
+  )
+}
+
+function isTransientStreamError(msg: string): boolean {
+  return isUnexpectedEofError(msg) || isWebSocketStreamError(msg)
+}
+
 function runKubectl(
   args: string[],
   { timeout = 30000, maxBuffer = 32 * 1024 * 1024 }: RunOptions = {},
@@ -130,7 +154,7 @@ function runKubectl(
     execFile(
       'kubectl',
       [...kubeconfigArgs(), ...args],
-      { timeout, maxBuffer, encoding: 'utf8' },
+      { timeout, maxBuffer, encoding: 'utf8', env: kubectlEnv() },
       (err, stdout, stderr) => {
         if (err) {
           const raw = (stderr || err.message || 'kubectl failed').trim()
@@ -141,7 +165,7 @@ function runKubectl(
           // Attach a machine-readable code for the renderer without relying on string parsing.
           ;(wrapped as unknown as Record<string, unknown>).code = isConnectionError(raw)
             ? 'CONNECTION_REFUSED'
-            : isUnexpectedEofError(raw)
+            : isTransientStreamError(raw)
               ? 'UNEXPECTED_EOF'
               : 'KUBECTL_ERROR'
           reject(wrapped)
@@ -380,6 +404,16 @@ export function parseLsLine(line: string): DirEntry | null {
 
 type EntryKindOf = DirEntry['type']
 
+function parseLsOutput(out: string): DirEntry[] {
+  const entries: DirEntry[] = []
+  for (const line of out.split('\n')) {
+    if (!line.trim()) continue
+    const entry = parseLsLine(line)
+    if (entry) entries.push(entry)
+  }
+  return entries
+}
+
 function posixJoin(...parts: string[]): string {
   return parts.join('/').replace(/\/+/g, '/')
 }
@@ -392,13 +426,34 @@ function basename(p: string): string {
 async function listDir(sel: KubectlTarget, remotePath: string): Promise<DirEntry[]> {
   const base = podArgs(sel)
   const lsArgs = [...base, '--', 'ls', '-la', '--time-style=long-iso', '--', remotePath]
+  const lsNumericArgs = [...base, '--', 'ls', '-lna', '--time-style=long-iso', '--', remotePath]
+
+  // Companion listing with numeric uid/gid (`-n`). Best effort: not every
+  // `ls` supports it, failures just leave uid/gid undefined.
+  const fetchNumeric = async (): Promise<DirEntry[] | null> => {
+    let raw: string
+    try {
+      raw = await runKubectl(lsNumericArgs)
+    } catch {
+      try {
+        // BusyBox / minimal images may not support --time-style or --
+        raw = await runKubectl([...base, '--', 'ls', '-lna', remotePath])
+      } catch {
+        return null
+      }
+    }
+    return parseLsOutput(raw)
+  }
+
   let out: string
+  let numeric: DirEntry[] | null
   try {
-    out = await runKubectl(lsArgs)
+    ;[out, numeric] = await Promise.all([runKubectl(lsArgs), fetchNumeric()])
   } catch {
     try {
       // BusyBox / minimal images may not support --time-style or --
       out = await runKubectl([...base, '--', 'ls', '-la', remotePath])
+      numeric = null
     } catch (secondErr) {
       throw explainExecFailure(
         secondErr instanceof Error ? secondErr : new Error(String(secondErr)),
@@ -406,12 +461,19 @@ async function listDir(sel: KubectlTarget, remotePath: string): Promise<DirEntry
       )
     }
   }
-  const lines = out.split('\n')
-  const entries: DirEntry[] = []
-  for (const line of lines) {
-    if (!line.trim()) continue
-    const entry = parseLsLine(line)
-    if (entry) entries.push(entry)
+  const entries = parseLsOutput(out)
+  if (numeric) {
+    const byName = new Map(numeric.map((e) => [e.name, e]))
+    for (const entry of entries) {
+      const num = byName.get(entry.name)
+      if (!num) continue
+      const uid = Number(num.owner)
+      const gid = Number(num.group)
+      if (Number.isFinite(uid) && Number.isFinite(gid)) {
+        entry.uid = uid
+        entry.gid = gid
+      }
+    }
   }
   entries.sort((a, b) => {
     if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
@@ -468,7 +530,7 @@ async function downloadItem(
       () => '',
     )
     const isDir = statRes.startsWith('d')
-    if (isDir && isUnexpectedEofError(msg)) {
+    if (isDir && isTransientStreamError(msg)) {
       // Remove any partial result left by the failed cp.
       await fsp.rm(localDest, { recursive: true, force: true }).catch(() => {})
       progress('download', `Retrying ${name} via tar…`)
@@ -492,7 +554,7 @@ function downloadDirViaTar(sel: KubectlTarget, remotePath: string, destDir: stri
     const kubectlChild = spawn(
       'kubectl',
       [...kubeconfigArgs(), ...podArgs(sel), '--', 'sh', '-c', remoteCmd],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
+      { stdio: ['ignore', 'pipe', 'pipe'], env: kubectlEnv() },
     )
     const tarChild = spawn('tar', ['xf', '-', '-C', destDir], {
       stdio: ['pipe', 'ignore', 'pipe'],
@@ -551,7 +613,7 @@ function catToFile(sel: KubectlTarget, remotePath: string, localDest: string): P
     const child = spawn(
       'kubectl',
       [...kubeconfigArgs(), ...podArgs(sel), '-i', '--', 'cat', remotePath],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
+      { stdio: ['ignore', 'pipe', 'pipe'], env: kubectlEnv() },
     )
     const ws = fs.createWriteStream(localDest)
     child.stdout!.pipe(ws)
@@ -605,7 +667,7 @@ function pipeFileToCat(sel: KubectlTarget, localPath: string, remoteDest: string
         '-c',
         `cat > ${shq(posixJoin(parent, leaf))}`,
       ],
-      { stdio: ['pipe', 'ignore', 'pipe'] },
+      { stdio: ['pipe', 'ignore', 'pipe'], env: kubectlEnv() },
     )
     const rs = fs.createReadStream(localPath)
     rs.pipe(child.stdin!)
@@ -943,10 +1005,28 @@ ipcMain.handle('fs:downloadZip', async (_e: IpcMainInvokeEvent, req: DownloadZip
       localDir = await downloadItem(req.sel, req.path, stageDir)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
-      // Don't throw to Electron's "Error occurred in handler" logger – report
-      // via progress and return an error payload the renderer can display.
-      progress('download', `Download failed: ${msg}`, 'error')
-      return { canceled: false, error: msg } as unknown as { canceled: boolean; savedTo?: string }
+      // Transient stream errors (WebSocket `%!w(<nil>)` / `close 1006` / `unexpected EOF`)
+      // can still occur on SPDY under load. Retry once after cleaning partial output.
+      if (isTransientStreamError(msg)) {
+        await fsp.rm(stageDir, { recursive: true, force: true }).catch(() => {})
+        await fsp.mkdir(stageDir, { recursive: true })
+        progress('download', `Retrying ${req.name}…`)
+        try {
+          localDir = await downloadItem(req.sel, req.path, stageDir)
+        } catch (retryErr) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+          progress('download', `Download failed: ${retryMsg}`, 'error')
+          return { canceled: false, error: retryMsg } as unknown as {
+            canceled: boolean
+            savedTo?: string
+          }
+        }
+      } else {
+        // Don't throw to Electron's "Error occurred in handler" logger – report
+        // via progress and return an error payload the renderer can display.
+        progress('download', `Download failed: ${msg}`, 'error')
+        return { canceled: false, error: msg } as unknown as { canceled: boolean; savedTo?: string }
+      }
     }
     progress('download', `Zipping ${req.name}…`, 'running', 0)
     try {

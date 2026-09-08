@@ -38,6 +38,9 @@ export interface DirEntry {
   perms: string
   modified: number | null
   linkTarget: string | null
+  /** Numeric uid/gid, resolved from a parallel `ls -ln` listing. */
+  uid?: number
+  gid?: number
 }
 
 export type OpKind = 'download' | 'upload' | 'delete' | 'drag' | 'open'
