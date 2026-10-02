@@ -86,7 +86,7 @@
     "@typescript-eslint/eslint-plugin": "^8.71.0",
     "@typescript-eslint/parser": "^8.71.0",
     "archiver": "^8.0.0",
-    "electron": "^44.4.5",
+    "electron": "^44.5.0",
     "electron-builder": "^26.15.3",
     "esbuild": "^0.28.2",
     "eslint": "^10.11.0",
